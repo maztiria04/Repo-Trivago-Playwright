@@ -27,3 +27,14 @@ jobs:
           SHEETS_WEBAPP_URL: ${{ secrets.SHEETS_WEBAPP_URL }}
           MAX_ITEMS: "30"
         run: npm start
+     
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivago-debug
+          path: |
+            debug.png
+            debug.html
+          if-no-files-found: ignore
+
