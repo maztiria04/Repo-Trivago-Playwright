@@ -19,16 +19,71 @@ function uniqBy(arr, keyFn) {
   return out;
 }
 
-function pickPrice(text) {
-  // Ejemplos típicos: "AR$ 12.345", "US$ 120", "$ 10.000", "€ 99"
-  const m = text.match(/(US\$|AR\$|ARS|\$|€)\s?[\d.\,]+/);
+function pickPriceFromAny(obj) {
+  // Heurística para encontrar un precio en objetos JSON desconocidos
+  const s = JSON.stringify(obj);
+  const m = s.match(/(US\$|AR\$|ARS|\$|€)\s?[\d.\,]{2,}/);
   return m ? m[0] : "";
 }
 
+function deepFindItems(root, limit = 5000) {
+  const out = [];
+  const stack = [root];
+  let steps = 0;
+
+  while (stack.length && steps < limit) {
+    steps++;
+    const cur = stack.pop();
+    if (!cur) continue;
+
+    if (Array.isArray(cur)) {
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+    if (typeof cur !== "object") continue;
+
+    // Heurística de “card”
+    const name =
+      cur.name ||
+      cur.title ||
+      cur.hotelName ||
+      cur.accommodationName ||
+      cur.propertyName ||
+      "";
+
+    // URL
+    const url = cur.url || cur.href || cur.link || cur.clickoutUrl || "";
+
+    // Provider
+    const provider = cur.provider || cur.partner || cur.vendor || cur.site || cur.advertiser || "";
+
+    // Precio
+    const priceText =
+      cur.priceText ||
+      cur.displayPrice ||
+      cur.formattedPrice ||
+      (cur.price && (cur.price.display || cur.price.formatted || cur.price.text)) ||
+      "";
+
+    const priceGuess = priceText || pickPriceFromAny(cur);
+
+    if (typeof name === "string" && name.length > 3 && priceGuess) {
+      out.push({
+        name: String(name).trim(),
+        priceText: String(priceGuess).trim(),
+        provider: String(provider || "").trim(),
+        url: String(url || "").trim()
+      });
+    }
+
+    for (const k of Object.keys(cur)) stack.push(cur[k]);
+  }
+
+  return out;
+}
+
 (async () => {
-  const browser = await chromium.launch({
-    headless: true
-  });
+  const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
     locale: "es-AR",
@@ -39,103 +94,93 @@ function pickPrice(text) {
   const page = await context.newPage();
   page.setDefaultTimeout(120000);
 
+  // Capturar candidates desde la red
+  const networkItems = [];
+  page.on("response", async (resp) => {
+    try {
+      const url = resp.url();
+      const ct = (resp.headers()["content-type"] || "").toLowerCase();
+      if (!ct.includes("application/json")) return;
+
+      // Trivago suele pegar endpoints con "search", "offers", "pricing", etc.
+      if (!/search|offer|price|pricing|deal|result|accommod/i.test(url)) return;
+
+      const json = await resp.json();
+      const found = deepFindItems(json, 6000);
+      if (found.length) networkItems.push(...found);
+    } catch (_) {}
+  });
+
   await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
 
-  // Aceptar cookies si aparece (best-effort)
+  // cookies (best-effort)
   try {
-    // Trivago cambia textos; cubrimos varios
-    const cookieButtons = [
-      'button:has-text("Aceptar")',
-      'button:has-text("I agree")',
-      'button:has-text("Accept")',
-      'button:has-text("Agree")'
-    ];
-    for (const sel of cookieButtons) {
-      const btn = page.locator(sel);
-      if (await btn.count()) {
-        await btn.first().click({ timeout: 3000 });
-        break;
-      }
-    }
+    const btn = page.locator('button:has-text("Aceptar"), button:has-text("Accept")');
+    if (await btn.count()) await btn.first().click({ timeout: 3000 });
   } catch (_) {}
 
-  // Espera a que haya contenido real
-  await page.waitForTimeout(6000);
+  // dar tiempo a XHR
+  await page.waitForTimeout(12000);
 
-  // Scroll para disparar lazy-load
-  for (let i = 0; i < 6; i++) {
+  // scroll para disparar más requests
+  for (let i = 0; i < 10; i++) {
     await page.mouse.wheel(0, 1600);
     await page.waitForTimeout(1200);
   }
 
-  // Extraer resultados
-  const items = await page.evaluate(() => {
-    const out = [];
+  // Si la red no dio nada, fallback DOM (más amplio que article)
+  let items = uniqBy(networkItems, it => `${it.name}||${it.priceText}||${it.url}`.toLowerCase());
 
-    // Heurística: cards en "article" suele capturar list items
-    const cards = Array.from(document.querySelectorAll("article"));
+  if (items.length === 0) {
+    const domItems = await page.evaluate(() => {
+      const out = [];
+      const candidates = Array.from(document.querySelectorAll("article, a[href]"));
 
-    for (const c of cards) {
-      const text = (c.innerText || "").trim();
-      if (!text) continue;
+      for (const el of candidates) {
+        const text = (el.innerText || "").trim();
+        if (!text) continue;
+        const pm = text.match(/(US\$|AR\$|ARS|\$|€)\s?[\d.\,]+/);
+        if (!pm) continue;
 
-      // Buscar precio
-      const priceMatch = text.match(/(US\$|AR\$|ARS|\$|€)\s?[\d.\,]+/);
-      if (!priceMatch) continue;
+        const name =
+          (el.querySelector("h1,h2,h3")?.textContent || "").trim() ||
+          (text.split("\n").find(l => l.trim().length > 6) || "").trim();
 
-      // Nombre: h1/h2/h3 dentro de card
-      const name =
-        (c.querySelector("h1,h2,h3")?.textContent || "").trim() ||
-        (text.split("\n").find((l) => l.trim().length > 6) || "").trim();
+        let href = "";
+        const a = el.tagName.toLowerCase() === "a" ? el : el.querySelector("a[href]");
+        if (a) href = a.href || "";
 
-      // Proveedor: a veces aparece como "Booking.com", "Expedia", etc. (best-effort)
-      const providerLine = text.split("\n").find(l =>
-        /booking|expedia|agoda|despegar|hotels\.com|airbnb|trip\.com/i.test(l)
-      ) || "";
+        out.push({ name, priceText: pm[0], provider: "", url: href });
+        if (out.length >= 60) break;
+      }
+      return out;
+    });
 
-      const a = c.querySelector('a[href]');
-      const url = a ? a.href : "";
+    items = uniqBy(domItems, it => `${it.name}||${it.priceText}||${it.url}`.toLowerCase());
+  }
 
-      out.push({
-        name,
-        priceText: priceMatch[0],
-        provider: providerLine.trim(),
-        url
-      });
-    }
+  items = items.filter(it => it.name && it.priceText).slice(0, MAX_ITEMS);
 
-    return out;
-  });
+  // DEBUG artifacts si sigue en 0
+  if (items.length === 0) {
+    await page.screenshot({ path: "debug.png", fullPage: true });
+    const html = await page.content();
+    await Bun?.write?.("debug.html", html); // si no existe Bun, ignorado
+    // fallback node write:
+    await import("fs").then(fs => fs.writeFileSync("debug.html", html, "utf8"));
+    console.log("DEBUG: saved debug.png and debug.html");
+  }
 
   await browser.close();
 
-  // Dedupe + limit
-  const cleaned = uniqBy(
-    items
-      .map(it => ({
-        name: (it.name || "").trim(),
-        priceText: (it.priceText || "").trim(),
-        provider: (it.provider || "").trim(),
-        url: (it.url || "").trim()
-      }))
-      .filter(it => it.name && it.priceText),
-    it => `${it.name}||${it.priceText}||${it.url}`.toLowerCase()
-  ).slice(0, MAX_ITEMS);
-
-  // Post a Apps Script Web App
   const resp = await fetch(WEBAPP_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      searchUrl: SEARCH_URL,
-      items: cleaned
-    })
+    body: JSON.stringify({ searchUrl: SEARCH_URL, items })
   });
 
   const text = await resp.text();
-  if (!resp.ok) {
-    throw new Error(`WebApp error ${resp.status}: ${text}`);
-  }
+  if (!resp.ok) throw new Error(`WebApp error ${resp.status}: ${text}`);
 
-  console.log(`OK posted ${cleaned.length} items. WebApp response: ${text}`);
+  console.log(`OK posted ${items.length} items. WebApp response: ${text}`);
 })();
