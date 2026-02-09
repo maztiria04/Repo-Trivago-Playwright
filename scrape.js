@@ -161,15 +161,11 @@ function deepFindItems(root, limit = 5000) {
 
   items = items.filter(it => it.name && it.priceText).slice(0, MAX_ITEMS);
 
-  // DEBUG artifacts si sigue en 0
-  if (items.length === 0) {
-    await page.screenshot({ path: "debug.png", fullPage: true });
-    const html = await page.content();
-    await Bun?.write?.("debug.html", html); // si no existe Bun, ignorado
-    // fallback node write:
-    await import("fs").then(fs => fs.writeFileSync("debug.html", html, "utf8"));
-    console.log("DEBUG: saved debug.png and debug.html");
-  }
+  // DEBUG artifacts (SIEMPRE)
+  await page.screenshot({ path: "debug.png", fullPage: true });
+  const html = await page.content();
+  await import("fs").then(fs => fs.writeFileSync("debug.html", html, "utf8"));
+  console.log("DEBUG: saved debug.png and debug.html");
 
   await browser.close();
 
